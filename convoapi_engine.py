@@ -212,13 +212,28 @@ def coerce_value(a: ArgSpec, token: str):
 
 
 def classify_token(func: FuncSpec, tok: str) -> str:
-    # Priority: enum > int > float > bool > string
-    # If any enum arg can accept it, treat as enum token
+    t = tok.lower()
+    # strict enum acceptance (exact only)
     for a in func.args:
         if a.type == "enum":
-            v, _ = enum_match(a, tok)
-            if v is not None:
-                return "enum"
+            for ev in a.enum:
+                if t == ev.value.lower():
+                    return "enum"
+                for al in ev.aliases:
+                    if t == al.lower():
+                        return "enum"
+    # fuzzy enum only if token contains letters (to avoid '4' → 'a')
+    if any(ch.isalpha() for ch in t):
+        all_opts = []
+        for a in func.args:
+            if a.type == "enum":
+                for ev in a.enum:
+                    all_opts.append(ev.value.lower())
+                    for al in ev.aliases:
+                        all_opts.append(al.lower())
+        match, fuzzy = fuzzy_match(t, all_opts)
+        if fuzzy and match in all_opts:
+            return "enum"
     if is_int_token(tok):
         return "int"
     if is_float_token(tok):
@@ -326,6 +341,14 @@ class Engine:
             return True
         segs = split_segments(line)
         first = segs[0].strip().lower()
+        # fuzzy reserved command mapping (skip when awaiting broadcast fill)
+        if not hasattr(self, "await_plan_fill") and any(ch.isalpha() for ch in first) and first not in {r.lower() for r in RESERVED}:
+            match, fuzzy = fuzzy_match(first, [r.lower() for r in RESERVED])
+            if fuzzy and match in {r.lower() for r in RESERVED}:
+                # echo interpretation and replace 'first' for downstream handling
+                self.write(f"[interpreted {first} → {match}]")
+                first = match
+
         if first in ["end"]:
             self.write("Goodbye.")
             return False
@@ -344,6 +367,9 @@ class Engine:
             if self.current:
                 self.scratch[f"last {self.current.func.name}"] = self.current
             self.open_function(name)
+            return True
+        if first == "back":
+            self.write("Use undo or rewind to ARGNAME.")
             return True
         if first == "home":
             self.current = None
@@ -371,7 +397,7 @@ class Engine:
             if not self.current:
                 self.write("No draft to rewind.")
                 return True
-            m = re.search(r"rewind\\s+to\\s+(.+)", line, re.I)
+            m = re.search(r"rewind\s+to\s+(.+)", line, re.I)
             if not m:
                 self.write("Say: rewind to ARGNAME")
                 return True
@@ -394,7 +420,7 @@ class Engine:
             if not self.current:
                 self.write("No draft to undo.")
                 return True
-            m = re.search(r"undo\\s+(\\d+)", first)
+            m = re.search(r"undo\s+(\d+)", first)
             n = int(m.group(1)) if m else 1
             while n>0 and self.history:
                 typ, payload = self.history.pop()
@@ -449,7 +475,7 @@ class Engine:
 
     def handle_edit(self, line: str) -> bool:
         if self.plan:
-            m = re.match(r"edit\\s+(\\d+)\\s+([a-z ]+)\\s+(.+)", line, re.I)
+            m = re.match(r"edit\s+(\d+)\s+([a-z ]+)\s+(.+)", line, re.I)
             if not m:
                 self.write("Say: edit INDEX ARGNAME VALUE")
                 return True
@@ -475,10 +501,11 @@ class Engine:
                 return True
             d.values[a.name] = val
             self.history.append(("edit_plan", {"idx": idx, "key": a.name, "old": old}))
+            self.write("Updated.")
             self.preview_current()
             return True
         elif self.current:
-            m = re.match(r"edit\\s+([a-z ]+)\\s+(.+)", line, re.I)
+            m = re.match(r"edit\s+([a-z ]+)\s+(.+)", line, re.I)
             if not m:
                 self.write("Say: edit ARGNAME VALUE")
                 return True
@@ -511,6 +538,7 @@ class Engine:
             return True
         func = self.current.func
         vectors: Dict[str, List[Any]] = {}
+        last_arg = None
         for seg in segs:
             st = seg.strip()
             if not st:
@@ -522,33 +550,52 @@ class Engine:
             tokens = tokenize_segment(st)
             if not tokens:
                 continue
-            def pick_arg(tokens):
-                if len(tokens) >= 2:
-                    a2 = arg_lookup(func, f"{tokens[0]} {tokens[1]}")
-                    if a2:
-                        return a2, tokens[2:]
-                a1 = arg_lookup(func, tokens[0])
-                if a1:
-                    return a1, tokens[1:]
-                return None, tokens[1:]
-            a, rest = pick_arg(tokens)
+            # try to pick an arg
+            a = None
+            rest_tokens = []
+            if len(tokens) >= 2:
+                a = arg_lookup(func, f"{tokens[0]} {tokens[1]}", fuzzy_ok=False)
+                if a:
+                    rest_tokens = tokens[2:]
             if not a:
-                self.write(f"Argument not recognized in segment: {seg}")
-                return True
-            value_str = " ".join(rest).strip()
-            inner = split_segments(value_str)
+                a = arg_lookup(func, tokens[0], fuzzy_ok=False)
+                if a:
+                    rest_tokens = tokens[1:]
+            if not a:
+                # no arg label here; if we have a last_arg, treat segment as more values for it
+                if last_arg:
+                    a = last_arg
+                    rest_tokens = tokens
+                else:
+                    self.write(f"Argument not recognized in segment: {seg}")
+                    return True
+            last_arg = a
+            value_str = " ".join(rest_tokens).strip()
+            if not value_str and a.type != "string":
+                # single bare value token may be in tokens when no labels
+                pass
+            inner = split_segments(value_str) if value_str else []
             vals = []
+            if not inner and rest_tokens:
+                inner = [" ".join(rest_tokens)]
+            if not inner and not rest_tokens and tokens:
+                # e.g., segment 'b' after previously labeled fruit
+                inner = [" ".join(tokens)]
             for val_seg in inner:
-                val_seg = val_seg.strip()
-                if not val_seg:
+                vs = val_seg.strip()
+                if not vs:
                     continue
                 if a.type == "string":
-                    vals.append(val_seg)
+                    vals.append(vs)
                 else:
-                    first_tok = tokenize_segment(val_seg)[0]
+                    first_tok = tokenize_segment(vs)[0]
                     coerced, _ = coerce_value(a, first_tok)
                     vals.append(coerced)
-            vectors[a.name] = vals
+            if a.name in vectors:
+                vectors[a.name].extend(vals)
+            else:
+                vectors[a.name] = vals
+        # determine targets
         n_targets = 1
         for vs in vectors.values():
             if len(vs) > 1:
@@ -790,7 +837,7 @@ def default_spec() -> ConvoSpec:
                 prompt_power="fruit apple  or  a  .  over fruit apple, banana."
             ),
             ArgSpec(name="qty", type="int", required=True,
-                constraints={"min":1,"max":6}, shortkey="q",
+                constraints={"min":1,"max":20}, shortkey="q",
                 prompt_beginner="Quantity 1 to 6?",
                 prompt_power="qty 4  or  q 4"),
             ArgSpec(name="price cap", type="float", required=False,
