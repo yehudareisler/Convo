@@ -75,7 +75,7 @@ TPL_CREATED_SINGLE = "✅ {func} {cid}"
 
 # Fuzzy command recognition thresholds & guardrails
 FUZZY_MAX_ABS = 2          # maximum absolute edit distance
-FUZZY_MAX_REL = 0.34       # maximum relative distance (d/len <= this)
+FUZZY_MAX_REL = 0.5       # maximum relative distance (d/len <= this)
 FUZZY_MIN_LEN = 2          # ignore fuzzy if token length < 2 (unless alias)
 FUZZY_REQUIRE_ALPHA = True # only fuzz tokens containing letters
 FUZZY_SKIP_WHEN_AWAITING_VALUE = True  # while filling broadcast prompt, don't fuzzy commands
@@ -188,6 +188,11 @@ def fuzzy_command(token: str, commands: List[str]) -> FuzzyMatch:
         return FuzzyMatch(False, None, 0)
     rel = best_d / max(1, len(best))
     if best_d <= FUZZY_MAX_ABS and rel <= FUZZY_MAX_REL:
+        # Extra guard to avoid matches like 'zzswitch' -> 'switch'
+        first_alpha = next((c for c in t if c.isalpha()), '')
+        best_first_alpha = next((c for c in best if c.isalpha()), '')
+        if best_d >= 2 and first_alpha and best_first_alpha and first_alpha != best_first_alpha:
+            return FuzzyMatch(False, None, best_d)
         return FuzzyMatch(True, best, best_d)
     return FuzzyMatch(False, None, best_d)
 
@@ -759,6 +764,21 @@ def _apply_positional_tokens(ctx: Context, func: FuncSpec, draft_values: Dict[st
         if category == "string":
             string_unmet = [a for a in func.args if a.type == "string" and a.name not in draft_values]
             if len(string_unmet) > 1:
+                req_unmet = [a for a in string_unmet if a.required]
+                if len(req_unmet) == 1:
+                    chosen = req_unmet[0]
+                    rest = " ".join(tokens[i:])
+                    val, hint = coerce_value(chosen, rest)
+                    draft_values[chosen.name] = val
+                    if hint:
+                        ctx.add_hint(hint)
+                    ctx.state["history"].append({"type": "set", "payload": {"key": chosen.name, "old": None}})
+                    return None
+                elif len(req_unmet) >= 2:
+                    return ERR_AMBIGUOUS_STRING
+
+            string_unmet = [a for a in func.args if a.type == "string" and a.name not in draft_values]
+            if len(string_unmet) > 1:
                 return ERR_AMBIGUOUS_STRING
         # Build candidate pool for this token
         candidates = []
@@ -950,7 +970,7 @@ def handle_over(ctx: Context, args: str, segments: List[str]) -> str:
                 ctx.set_await_fill(i, a.name)
                 desc = _describe_item(func, d["values"])
                 return "\n".join([
-                    f"Three targets; {a.name} has missing values. Need {a.name} for item {i+1} {desc}.",
+                    f"{n_targets} targets; {a.name} has missing values. Need {a.name} for item {i+1} {desc}.",
                     "Reply a value, or fill last, or cancel."
                 ])
     return "\n".join(ctx.preview())
