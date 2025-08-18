@@ -839,7 +839,10 @@ def _scan_labeled_pairs(ctx: Context, func: FuncSpec, segment: str, draft_values
         if a2:
             if a2.type == "string":
                 val = " ".join(tokens[i+2:]).strip()
-                v, hint = coerce_value(a2, val)
+                try:
+                    v, hint = coerce_value(a2, val)
+                except Exception as e:
+                    return str(e), []
                 draft_values[a2.name] = v
                 if hint:
                     ctx.add_hint(hint)
@@ -868,7 +871,10 @@ def _scan_labeled_pairs(ctx: Context, func: FuncSpec, segment: str, draft_values
             else:
                 if i + 1 >= len(tokens):
                     return f"Missing value for {a1.name}.", []
-                v, hint = coerce_value(a1, tokens[i+1])
+                try:
+                    v, hint = coerce_value(a1, tokens[i+1])
+                except Exception as e:
+                    return str(e), []
                 draft_values[a1.name] = v
                 if hint:
                     ctx.add_hint(hint)
