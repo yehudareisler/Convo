@@ -328,7 +328,7 @@ class Context:
                 parts = []
                 for a in func.args:
                     v = d["values"].get(a.name, None)
-                    parts.append(f"{a.name} {v if v is not None else 'none'}")
+                    parts.append(f"{a.name}: {v if v is not None else 'none'}")
                 lines.append(f"{i}) " + ", ".join(parts))
             lines.append(TPL_CONFIRM_HINT_PLAN)
             return lines
@@ -337,7 +337,7 @@ class Context:
             lines = [TPL_PREVIEW_HEADER]
             for a in func.args:
                 v = self.current["values"].get(a.name, None)
-                lines.append(f"- {a.name} {v if v is not None else 'none'}")
+                lines.append(f"- {a.name}: {v if v is not None else 'none'}")
             lines.append(TPL_CONFIRM_HINT_SINGLE)
             return lines
         return [MSG_HOME]
@@ -348,11 +348,12 @@ class Context:
         nxt = self.next_arg()
         if not nxt:
             return self.render(self.preview())
-        # Beginner + Power prompts
-        return self.render([
-            f"Beginner: {nxt.prompt_beginner}",
-            f"Power: {nxt.prompt_power}"
-        ])
+        # Clean prompt + a single "Pro tip" line (uses your power example)
+        lines = [f"{nxt.prompt_beginner}"]
+        if nxt.prompt_power:
+            lines.append(f'(Pro tip: write "{nxt.prompt_power}")')
+        return self.render(lines)
+
 
 
 # =========================
@@ -712,7 +713,11 @@ def _execute_and_receipt(func: FuncSpec, values: Dict[str, Any]) -> Tuple[str, s
     except Exception:
         pass
     cid = (func.name[:2] + "-" + uuid.uuid4().hex[:6]).upper()
-    pairs = ", ".join([f"{a.name} {values.get(a.name, None)}" for a in func.args])
+
+    def _fmt_val(v):
+        return "none" if v is None else v
+
+    pairs = ", ".join([f"{a.name} {_fmt_val(values.get(a.name, None))}" for a in func.args])
     rec = TPL_RECEIPT_LINE.format(pairs=pairs)
     return cid, rec
 
@@ -754,13 +759,32 @@ def _classify_token(func: FuncSpec, tok: str) -> str:
         return "bool"
     return "string"
 
-def _apply_positional_tokens(ctx: Context, func: FuncSpec, draft_values: Dict[str, Any], tokens: List[str]) -> Optional[str]:
+def _apply_positional_tokens(ctx: Context, func: FuncSpec,
+                             draft_values: Dict[str, Any],
+                             tokens: List[str]) -> Optional[str]:
     # Assign unlabeled tokens by precedence: earliest unmet required, then earliest unmet optional
     i = 0
     while i < len(tokens):
         tok = tokens[i]
+
+        # Skip keywords for the next unmet (optional) arg
+        if tok.lower() in {"none", "skip", "n/a"}:
+            # find earliest unmet arg
+            for a in func.args:
+                if a.name not in draft_values:
+                    if a.required:
+                        return f"{a.name} is required"
+                    # explicitly mark as none/omitted
+                    draft_values[a.name] = None
+                    ctx.state["history"].append({"type": "set", "payload": {"key": a.name, "old": None}})
+                    i += 1
+                    break
+            else:
+                i += 1
+            continue
+
         category = _classify_token(func, tok)
-        # Check ambiguous unlabeled string case
+        # Ambiguous unlabeled string case—prefer the sole required string arg
         if category == "string":
             string_unmet = [a for a in func.args if a.type == "string" and a.name not in draft_values]
             if len(string_unmet) > 1:
@@ -777,9 +801,6 @@ def _apply_positional_tokens(ctx: Context, func: FuncSpec, draft_values: Dict[st
                 elif len(req_unmet) >= 2:
                     return ERR_AMBIGUOUS_STRING
 
-            string_unmet = [a for a in func.args if a.type == "string" and a.name not in draft_values]
-            if len(string_unmet) > 1:
-                return ERR_AMBIGUOUS_STRING
         # Build candidate pool for this token
         candidates = []
         for a in func.args:
@@ -788,17 +809,22 @@ def _apply_positional_tokens(ctx: Context, func: FuncSpec, draft_values: Dict[st
             if a.type == category and type_accepts(a, tok):
                 candidates.append(a)
         if not candidates:
-            # If exactly one string slot remains, consume rest into it
-            only = next((a for a in func.args if a.type == "string" and a.name not in draft_values), None)
+            # If exactly one string slot remains, consume the rest into it
+            only = next((a for a in func.args
+                         if a.type == "string" and a.name not in draft_values), None)
             if only and category == "string":
                 rest = " ".join(tokens[i:])
                 val, hint = coerce_value(only, rest)
                 draft_values[only.name] = val
                 if hint:
                     ctx.add_hint(hint)
+                ctx.state["history"].append({"type": "set", "payload": {"key": only.name, "old": None}})
                 return None
+            # else: ignore token
             i += 1
             continue
+
+        # Choose earliest unmet required; else earliest unmet optional
         reqs = [a for a in candidates if a.required]
         pool = reqs if reqs else candidates
         chosen = None
@@ -813,6 +839,7 @@ def _apply_positional_tokens(ctx: Context, func: FuncSpec, draft_values: Dict[st
                 draft_values[chosen.name] = val
                 if hint:
                     ctx.add_hint(hint)
+                ctx.state["history"].append({"type": "set", "payload": {"key": chosen.name, "old": None}})
                 return None
             else:
                 val, hint = coerce_value(chosen, tok)
@@ -821,7 +848,6 @@ def _apply_positional_tokens(ctx: Context, func: FuncSpec, draft_values: Dict[st
         draft_values[chosen.name] = val
         if hint:
             ctx.add_hint(hint)
-        # history (we only record that something was set; for positional, old is None)
         ctx.state["history"].append({"type": "set", "payload": {"key": chosen.name, "old": None}})
         i += 1
     return None
@@ -851,7 +877,10 @@ def _scan_labeled_pairs(ctx: Context, func: FuncSpec, segment: str, draft_values
             else:
                 if i + 2 >= len(tokens):
                     return f"Missing value for {a2.name}.", []
-                v, hint = coerce_value(a2, tokens[i+2])
+                try:
+                    v, hint = coerce_value(a2, tokens[i+2])
+                except Exception as e:
+                    return str(e), []
                 draft_values[a2.name] = v
                 if hint:
                     ctx.add_hint(hint)
